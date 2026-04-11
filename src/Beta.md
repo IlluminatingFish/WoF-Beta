@@ -1,7 +1,7 @@
 1. add GPU setting
 
 import os
-# Default GPUs 
+Default GPUs 
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
