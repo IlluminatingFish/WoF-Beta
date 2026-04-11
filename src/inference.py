@@ -2,6 +2,10 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import os
+# Default GPUs 
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+
 import json
 import torch
 import argparse
@@ -14,6 +18,16 @@ from tqdm import tqdm
 from app import BitwiseARModel
 from app.flame_model import FLAMEModel, RenderMesh
 from app.utils_videos import write_video
+
+
+def _chw_float_to_uint8_hwc(t: torch.Tensor) -> np.ndarray:
+    """CHW float [0,1] or [0,255] -> uint8 HWC for Gradio Image."""
+    x = t.detach().float().cpu()
+    if x.max() <= 1.0 + 1e-3:
+        x = x * 255.0
+    x = x.clamp(0, 255).byte().permute(1, 2, 0).numpy()
+    return np.ascontiguousarray(x)
+
 
 class ARTAvatarInferEngine:
     def __init__(self, load_gaga=False, fix_pose=False, clip_length=750, device='cuda'):
@@ -56,6 +70,26 @@ class ARTAvatarInferEngine:
         pred_motions[..., 104:] *= 0.0
         return pred_motions
 
+    def iter_render_frames(self, audio, pred_motions, shape_id="mesh", shape_code=None):
+        """Yield each rendered frame as CHW float (mesh: [0,1]; GAGAvatar: model output range)."""
+        if shape_id == "mesh":
+            if shape_code is None:
+                shape_code = audio.new_zeros(1, 300).to(self.device).expand(pred_motions.shape[0], -1)
+            else:
+                assert shape_code.dim() == 2, f'Invalid shape_code dim: {shape_code.dim()}.'
+                assert shape_code.shape[0] == 1, f'Invalid shape_code shape: {shape_code.shape}.'
+                shape_code = shape_code.to(self.device).expand(pred_motions.shape[0], -1)
+            verts = self.ARTalk.basic_vae.get_flame_verts(self.flame_model, shape_code, pred_motions, with_global=True)
+            for v in verts:
+                rgb = self.mesh_renderer(v[None])[0]
+                yield rgb.cpu()[0] / 255.0
+        else:
+            self.GAGAvatar.set_avatar_id(shape_id)
+            for motion in pred_motions:
+                batch = self.GAGAvatar.build_forward_batch(motion[None], self.GAGAvatar_flame)
+                rgb = self.GAGAvatar.forward_expression(batch)
+                yield rgb.cpu()[0]
+
     def rendering(self, audio, pred_motions, shape_id="mesh", shape_code=None, save_name='ARTAvatar.mp4'):
         print('Rendering...')
         pred_images = []
@@ -71,14 +105,12 @@ class ARTAvatarInferEngine:
                 rgb = self.mesh_renderer(v[None])[0]
                 pred_images.append(rgb.cpu()[0] / 255.0)
         else:
-            # assert isinstance(shape_id, str), f'Invalid shape_id type: {type(shape_id)}'
             self.GAGAvatar.set_avatar_id(shape_id)
             for motion in tqdm(pred_motions):
                 batch = self.GAGAvatar.build_forward_batch(motion[None], self.GAGAvatar_flame)
                 rgb = self.GAGAvatar.forward_expression(batch)
                 pred_images.append(rgb.cpu()[0])
         print('Done!')
-        # save video
         print('Saving video...')
         pred_images = torch.stack(pred_images)
         dump_path = os.path.join(self.output_dir, '{}.mp4'.format(save_name))
@@ -95,34 +127,54 @@ class ARTAvatarInferEngine:
         return torch.tensor(motion_np_smoothed).type_as(motion_codes)
 
 
-def run_gradio_app(engine):
-    def process_audio(input_type, audio_input, text_input, text_language, shape_id, style_id):
+def run_gradio_app(engine, default_online=False):
+    def process_audio(input_type, audio_input, text_input, text_language, shape_id, style_id, render_mode):
+        """Generator for Gradio. render_mode == 'online': stream frames; else original rendering() then one yield."""
+
+        def bail():
+            yield gr.skip(), gr.skip(), gr.skip()
+
         if input_type == "Audio" and audio_input is None:
             gr.Warning("Please upload an audio file")
-            return None
+            yield from bail()
+            return
         if input_type == "Text" and (text_input is None or len(text_input.strip()) == 0):
-            gr.Warning("Please input text content") 
-            return None
+            gr.Warning("Please input text content")
+            yield from bail()
+            return
         if input_type == "Text":
             gtts_lang = {"English": "en", "中文": "zh", "日本語": "ja", "Deutsch": "de", "Français": "fr", "Español": "es"}
             tts = gTTS(text=text_input, lang=gtts_lang[text_language])
             tts.save("./render_results/tts_output.wav")
             audio_input = "./render_results/tts_output.wav"
-        # load audio
         audio, sr = torchaudio.load(audio_input)
         audio = torchaudio.transforms.Resample(sr, 16000)(audio).mean(dim=0)
-        # inference
         if style_id == "default":
             engine.style_motion = None
         else:
             engine.set_style_motion(style_id)
         pred_motions = engine.inference(audio)
-        # render
         save_name = f'{audio_input.split("/")[-1].split(".")[0]}_{style_id.replace(".", "_")}_{shape_id.replace(".", "_")}'
-        engine.rendering(audio, pred_motions, shape_id=shape_id, save_name=save_name)
-        # save pred_motions
-        torch.save(pred_motions.float().cpu(), os.path.join(engine.output_dir, '{}_motions.pt'.format(save_name)))
-        return os.path.join(engine.output_dir, '{}.mp4'.format(save_name)), os.path.join(engine.output_dir, '{}_motions.pt'.format(save_name))
+        motion_path = os.path.join(engine.output_dir, '{}_motions.pt'.format(save_name))
+        video_path = os.path.join(engine.output_dir, '{}.mp4'.format(save_name))
+
+        if render_mode == "online":
+            print("Rendering (streaming frames to browser)...")
+            pred_images = []
+            for rgb in engine.iter_render_frames(audio, pred_motions, shape_id=shape_id):
+                pred_images.append(rgb)
+                preview = _chw_float_to_uint8_hwc(rgb)
+                yield gr.skip(), gr.skip(), preview
+            pred_images = torch.stack(pred_images)
+            print("Saving video...")
+            audio_trim = audio[: int(pred_images.shape[0] / 25.0 * 16000)]
+            write_video(pred_images * 255.0, video_path, 25.0, audio_trim, 16000, "aac")
+            torch.save(pred_motions.float().cpu(), motion_path)
+            yield video_path, motion_path, gr.update(value=None)
+        else:
+            engine.rendering(audio, pred_motions, shape_id=shape_id, save_name=save_name)
+            torch.save(pred_motions.float().cpu(), motion_path)
+            yield video_path, motion_path, gr.update(value=None)
 
     # create the gradio app
     if hasattr(engine, 'GAGAvatar'):
@@ -165,36 +217,45 @@ def run_gradio_app(engine):
                     choices=["default"] + all_style_id,
                     value="natural_0", label="Choose the style of the speaker",
                 )
+                render_mode = gr.Radio(
+                    choices=["offline", "online"],
+                    value="online" if default_online else "offline",
+                    label="Render mode",
+                    info="online: stream each frame to Live preview, then save MP4. offline: original batch render (same as CLI).",
+                )
             with gr.Column():
                 gr.Markdown("### Generated Video")
+                live_preview = gr.Image(label="Live preview (online mode)", type="numpy")
                 video_output = gr.Video(autoplay=True)
                 motion_output = gr.File(label="motion sequence", file_types=[".pt"])
-                
-        inputs = [input_type, audio_input, text_input, text_language, appearance, style]
+
+        inputs = [input_type, audio_input, text_input, text_language, appearance, style, render_mode]
         btn = gr.Button("Generate")
-        btn.click(fn=process_audio, inputs=inputs, outputs=[video_output, motion_output])
+        btn.click(fn=process_audio, inputs=inputs, outputs=[video_output, motion_output, live_preview])
+
+        ex_off = "offline"
 
         if hasattr(engine, 'GAGAvatar'):
             examples = [
-                ["Audio", "demo/jp1.wav", None, None, "12.jpg", "curious_0"],
-                ["Audio", "demo/jp2.wav", None, None, "12.jpg", "natural_3"],
-                ["Audio", "demo/eng1.wav", None, None, "12.jpg", "natural_2"],
-                ["Audio", "demo/eng2.wav", None, None, "12.jpg", "happy_1"],
-                ["Audio", "demo/cn1.wav", None, None, "11.jpg", "natural_1"],
-                ["Audio", "demo/cn2.wav", None, None, "12.jpg", "happy_2"],
-                ["Text", None, "Hello, this is a demo of ARTalk! Let's create something fun together.", "English", "12.jpg", "happy_0"],
-                ["Text", None, "让我们一起创造一些有趣的东西吧。", "中文", "12.jpg", "natural_0"],
+                ["Audio", "demo/jp1.wav", None, None, "12.jpg", "curious_0", ex_off],
+                ["Audio", "demo/jp2.wav", None, None, "12.jpg", "natural_3", ex_off],
+                ["Audio", "demo/eng1.wav", None, None, "12.jpg", "natural_2", ex_off],
+                ["Audio", "demo/eng2.wav", None, None, "12.jpg", "happy_1", ex_off],
+                ["Audio", "demo/cn1.wav", None, None, "11.jpg", "natural_1", ex_off],
+                ["Audio", "demo/cn2.wav", None, None, "12.jpg", "happy_2", ex_off],
+                ["Text", None, "Hello, this is a demo of ARTalk! Let's create something fun together.", "English", "12.jpg", "happy_0", ex_off],
+                ["Text", None, "让我们一起创造一些有趣的东西吧。", "中文", "12.jpg", "natural_0", ex_off],
             ]
         else:
             examples = [
-                ["Audio", "demo/jp1.wav", None, None, "mesh", "curious_0"],
-                ["Audio", "demo/jp2.wav", None, None, "mesh", "natural_3"],
-                ["Audio", "demo/eng1.wav", None, None, "mesh", "natural_2"],
-                ["Audio", "demo/eng2.wav", None, None, "mesh", "happy_1"],
-                ["Audio", "demo/cn1.wav", None, None, "mesh", "natural_1"],
-                ["Audio", "demo/cn2.wav", None, None, "mesh", "happy_2"],
-                ["Text", None, "Hello, this is a demo of ARTalk! Let's create something fun together.", "English", "mesh", "happy_0"],
-                ["Text", None, "让我们一起创造一些有趣的东西吧。", "中文", "mesh", "natural_0"],
+                ["Audio", "demo/jp1.wav", None, None, "mesh", "curious_0", ex_off],
+                ["Audio", "demo/jp2.wav", None, None, "mesh", "natural_3", ex_off],
+                ["Audio", "demo/eng1.wav", None, None, "mesh", "natural_2", ex_off],
+                ["Audio", "demo/eng2.wav", None, None, "mesh", "happy_1", ex_off],
+                ["Audio", "demo/cn1.wav", None, None, "mesh", "natural_1", ex_off],
+                ["Audio", "demo/cn2.wav", None, None, "mesh", "happy_2", ex_off],
+                ["Text", None, "Hello, this is a demo of ARTalk! Let's create something fun together.", "English", "mesh", "happy_0", ex_off],
+                ["Text", None, "让我们一起创造一些有趣的东西吧。", "中文", "mesh", "natural_0", ex_off],
             ]
         gr.Examples(examples=examples, inputs=inputs, outputs=video_output)
 
@@ -220,11 +281,16 @@ if __name__ == '__main__':
     parser.add_argument("--style_id", '-s', default='default', type=str)
 
     parser.add_argument("--run_app", action='store_true')
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="With --run_app: default Gradio 'Render mode' to online (streaming preview). UI can still switch to offline.",
+    )
     args = parser.parse_args()
 
     engine = ARTAvatarInferEngine(load_gaga=True, fix_pose=False, clip_length=args.clip_length)
     if args.run_app:
-        run_gradio_app(engine)
+        run_gradio_app(engine, default_online=args.online)
     else:
         shape_id = 'mesh' if args.shape_id not in engine.GAGAvatar.all_gagavatar_id.keys() else args.shape_id
         audio, sr = torchaudio.load(args.audio_path)

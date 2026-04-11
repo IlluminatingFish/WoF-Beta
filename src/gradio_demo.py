@@ -3,6 +3,10 @@
 
 import os
 import sys
+# Default visible GPUs (physical 4–7). Override with env before launch if needed.
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+
 import json
 import time
 import torch
