@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python inference.py --audio_path ./demo/eng1.wav --shape_id 1.jpg --style_id natural_0 --clip_length 750
