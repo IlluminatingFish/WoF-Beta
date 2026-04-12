@@ -1,13 +1,4 @@
-# Beta Release Notes — Streaming Live Preview
-
-
-## Quick Review (Added by TA): Describe your first pillar and your achievements very briefly.
-
-## Secondary Pillar Integration: Explain exactly how your second technical pillar was integrated into the core loop.
-
-## New Features: (e.g., "Added procedural skybox," "Integrated boids pathfinding with player collision").
-
-## Known Issues: Be honest about what is currently broken or unoptimized as you head into the final weeks of development.
+# Beta Release Notes
 
 We describe some changes in the codebase and improvement techniques below
 ---
