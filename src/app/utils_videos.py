@@ -23,7 +23,7 @@ def write_video(video_frames, output_path, fps, audio_samples=None, sample_rate=
         if acodec == "aac":
             audio_stream = container.add_stream("aac", rate=sample_rate)
             audio_stream.format = "fltp"
-        elif acodec == "vs_preview" or acodec == "debug":
+        elif acodec in ("vs_preview", "debug"):
             audio_stream = container.add_stream("mp3", rate=sample_rate)
             audio_stream.format = "fltp"
         else:
@@ -41,8 +41,7 @@ def write_video(video_frames, output_path, fps, audio_samples=None, sample_rate=
         assert audio_samples.ndim == 1, "Input audio samples should be a 1D array."
         num_samples_per_frame = int(sample_rate // fps)
         for i in range(0, audio_samples.shape[0], num_samples_per_frame):
-            # audio_frame = av.AudioFrame.from_ndarray(audio_samples[:, i:i + num_samples_per_frame], format="fltp", layout="mono")
-            chunk = audio_samples[i:i + num_samples_per_frame]
+            chunk = audio_samples[i : i + num_samples_per_frame]
             if chunk.shape[0] < num_samples_per_frame:
                 chunk = np.pad(chunk, (0, num_samples_per_frame - chunk.shape[0]), mode="constant")
             audio_frame = av.AudioFrame.from_ndarray(chunk[None], format="fltp", layout="mono")
@@ -55,8 +54,116 @@ def write_video(video_frames, output_path, fps, audio_samples=None, sample_rate=
     if audio_samples is not None:
         for packet in audio_stream.encode():
             container.mux(packet)
-    
+
     container.close()
+
+
+def _tensor_chw_to_rgb24_hwc_numpy(frame):
+    """Single frame CHW (torch, float 0–1 or uint8) -> contiguous uint8 HWC for PyAV."""
+    if isinstance(frame, torch.Tensor):
+        x = frame.detach().cpu()
+        if x.dtype != torch.uint8:
+            x = x.float()
+            if x.max() <= 1.0 + 1e-3:
+                x = x * 255.0
+            x = x.clamp(0, 255).byte()
+        x = x.permute(1, 2, 0).contiguous()
+        return np.ascontiguousarray(x.numpy())
+    raise TypeError("frame must be a torch.Tensor CHW")
+
+
+class IncrementalVideoWriter:
+    """Incremental H.264 (+ optional AAC opened before first video packet) into one MP4."""
+
+    def __init__(
+        self,
+        output_path: str,
+        fps: float,
+        sample_rate: int | None = 16000,
+        acodec: str = "aac",
+    ):
+        self.output_path = output_path
+        self.fps = int(fps)
+        self.sample_rate = sample_rate
+        self.acodec = acodec
+        self.container = None
+        self.stream = None
+        self.audio_stream = None
+        self.n_frames = 0
+
+    def _add_audio_stream(self, sample_rate: int) -> None:
+        if self.acodec == "aac":
+            self.audio_stream = self.container.add_stream("aac", rate=sample_rate)
+            self.audio_stream.format = "fltp"
+        elif self.acodec in ("vs_preview", "debug"):
+            self.audio_stream = self.container.add_stream("mp3", rate=sample_rate)
+            self.audio_stream.format = "fltp"
+        else:
+            raise ValueError("Unsupported audio codec.")
+
+    def write_frame(self, frame_chw) -> None:
+        arr = _tensor_chw_to_rgb24_hwc_numpy(frame_chw)
+        height, width = arr.shape[0], arr.shape[1]
+        if self.container is None:
+            self.container = av.open(self.output_path, mode="w")
+            self.stream = self.container.add_stream("h264", rate=self.fps)
+            self.stream.width = width
+            self.stream.height = height
+            self.stream.pix_fmt = "yuv420p"
+            self.stream.options = {"crf": "18"}
+            if self.sample_rate is not None:
+                self._add_audio_stream(self.sample_rate)
+        video_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
+        for packet in self.stream.encode(video_frame):
+            self.container.mux(packet)
+        self.n_frames += 1
+
+    def finalize(
+        self,
+        audio_samples=None,
+        sample_rate=None,
+        acodec="aac",
+    ) -> None:
+        if self.container is None or self.stream is None:
+            raise RuntimeError("IncrementalVideoWriter: no frames written")
+        for packet in self.stream.encode():
+            self.container.mux(packet)
+
+        if audio_samples is not None:
+            if isinstance(audio_samples, torch.Tensor):
+                audio_samples = audio_samples.cpu().numpy()
+            assert audio_samples.ndim == 1, "audio_samples should be 1D"
+            if self.audio_stream is None:
+                sr = sample_rate if sample_rate is not None else self.sample_rate
+                if sr is None:
+                    raise RuntimeError(
+                        "IncrementalVideoWriter: audio_samples given but no audio stream; "
+                        "construct with sample_rate=... or call finalize(sample_rate=...)"
+                    )
+                self._add_audio_stream(int(sr))
+            sr_eff = int(self.audio_stream.rate)
+            num_samples_per_frame = int(sr_eff // self.fps)
+            for i in range(0, audio_samples.shape[0], num_samples_per_frame):
+                chunk = audio_samples[i : i + num_samples_per_frame]
+                if chunk.shape[0] < num_samples_per_frame:
+                    chunk = np.pad(
+                        chunk,
+                        (0, num_samples_per_frame - chunk.shape[0]),
+                        mode="constant",
+                    )
+                audio_frame = av.AudioFrame.from_ndarray(
+                    chunk[None], format="fltp", layout="mono"
+                )
+                audio_frame.rate = sr_eff
+                for packet in self.audio_stream.encode(audio_frame):
+                    self.container.mux(packet)
+            for packet in self.audio_stream.encode():
+                self.container.mux(packet)
+
+        self.container.close()
+        self.container = None
+        self.stream = None
+        self.audio_stream = None
 
 
 def read_video_frames(video_path):

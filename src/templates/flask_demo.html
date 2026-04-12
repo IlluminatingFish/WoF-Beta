@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>WoF Beta — Flask</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.25rem; }
+    section { margin-bottom: 28px; border-bottom: 1px solid #ddd; padding-bottom: 20px; }
+    label { display: block; margin: 8px 0 4px; font-weight: 600; }
+    input, button { font-size: 1rem; }
+    button { margin-top: 12px; padding: 8px 16px; cursor: pointer; }
+    #timing { font-family: ui-monospace, monospace; font-size: 12px; background: #f6f6f6; padding: 12px; white-space: pre-wrap; max-height: 420px; overflow: auto; }
+    #log { font-size: 12px; color: #666; margin-top: 8px; }
+    .err { color: #c00; }
+    fieldset { border: 1px solid #ccc; padding: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>WoF-Beta — Flask</h1>
+  <p>Same pipeline for both modes. <strong>Offline</strong>: full MP4 in <code>X-WoF-Meta</code>, chunked body.
+     <strong>Online</strong>: parallel render + H.264 mux, then chunked MP4 (no preview). See timing JSON for fields.</p>
+
+  <section>
+    <label>Audio file</label>
+    <input type="file" id="audio" accept="audio/*,.wav"/>
+    <label>shape_id</label>
+    <input type="text" id="shape_id" value="mesh" style="width:100%;max-width:400px"/>
+    <label>style_id</label>
+    <input type="text" id="style_id" value="natural_0" style="width:100%;max-width:400px"/>
+    <label>clip_length (optional; empty = cap from 16 kHz audio at 25 fps)</label>
+    <input type="number" id="clip_length" value="" min="1" step="1" placeholder="auto"/>
+
+    <fieldset>
+      <legend>Mode</legend>
+      <label><input type="radio" name="mode" value="offline" checked/> Offline — chunked MP4 after generate</label>
+      <label><input type="radio" name="mode" value="online"/> Online — chunked MP4 stream (drain, no preview)</label>
+    </fieldset>
+
+    <div id="offline_chunk" style="display:block;">
+      <label>transfer_chunk_kb (offline chunk size)</label>
+      <input type="number" id="transfer_chunk_kb" value="24" min="1" max="512" step="1"/>
+    </div>
+
+    <button type="button" id="btn_run">Run</button>
+    <div id="log"></div>
+  </section>
+
+  <section>
+    <h2>Timing</h2>
+    <div id="timing">(not run yet)</div>
+  </section>
+
+  <section>
+    <h2>Output</h2>
+    <div id="links"></div>
+  </section>
+
+<script>
+function mode() {
+  return document.querySelector('input[name="mode"]:checked').value;
+}
+document.querySelectorAll('input[name="mode"]').forEach(function (r) {
+  r.addEventListener('change', function () {
+    document.getElementById('offline_chunk').style.display = mode() === 'offline' ? 'block' : 'none';
+  });
+});
+
+document.getElementById('btn_run').onclick = async function () {
+  const file = document.getElementById('audio').files[0];
+  if (!file) { alert('Choose an audio file'); return; }
+  document.getElementById('log').textContent = 'Running…';
+  document.getElementById('timing').textContent = '';
+  document.getElementById('links').innerHTML = '';
+
+  if (mode() === 'offline') {
+    const fd = new FormData();
+    fd.append('audio', file);
+    fd.append('shape_id', document.getElementById('shape_id').value.trim());
+    fd.append('style_id', document.getElementById('style_id').value.trim());
+    const clOff = document.getElementById('clip_length').value.trim();
+    if (clOff) fd.append('clip_length', clOff);
+    fd.append('transfer_chunk_kb', document.getElementById('transfer_chunk_kb').value);
+
+    const t0 = performance.now();
+    const r = await fetch('/api/offline', { method: 'POST', body: fd });
+    const metaRaw = r.headers.get('X-WoF-Meta');
+    if (!r.ok || !metaRaw) {
+      document.getElementById('log').innerHTML = '<span class="err">HTTP ' + r.status + '</span>';
+      return;
+    }
+    let meta;
+    try { meta = JSON.parse(metaRaw); } catch (e) {
+      document.getElementById('log').innerHTML = '<span class="err">Bad X-WoF-Meta</span>';
+      return;
+    }
+    const tHeaders = performance.now();
+    const buf = await r.arrayBuffer();
+    const t1 = performance.now();
+    const untilHeadersS = (tHeaders - t0) / 1000;
+    const mp4DownloadS = (t1 - tHeaders) / 1000;
+    const totalClientS = (t1 - t0) / 1000;
+
+    let resourceTiming = null;
+    try {
+      const entries = performance.getEntriesByType('resource');
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        if (e.name.indexOf('/api/offline') !== -1) {
+          resourceTiming = e;
+          break;
+        }
+      }
+    } catch (err) { /* ignore */ }
+
+    const client_seconds = {
+      fetch_until_body_done: Number(totalClientS.toFixed(4)),
+      until_response_headers_s: Number(untilHeadersS.toFixed(4)),
+      mp4_download_s: Number(mp4DownloadS.toFixed(4)),
+      mp4_body_only: Number(mp4DownloadS.toFixed(4)),
+    };
+    if (resourceTiming && resourceTiming.requestStart > 0 && resourceTiming.responseStart > 0) {
+      client_seconds.request_start_to_first_byte_s = Number(
+        ((resourceTiming.responseStart - resourceTiming.requestStart) / 1000).toFixed(4)
+      );
+      client_seconds.resource_duration_s = Number((resourceTiming.duration / 1000).toFixed(4));
+    }
+
+    document.getElementById('log').textContent = 'Done (offline).';
+    document.getElementById('timing').textContent = JSON.stringify({
+      server: meta,
+      client_seconds,
+    }, null, 2);
+    const blob = new Blob([buf], { type: 'video/mp4' });
+    const vurl = URL.createObjectURL(blob);
+    document.getElementById('links').innerHTML =
+      '<a href="' + vurl + '" download="out.mp4">video (blob)</a> · ' +
+      '<a href="' + meta.motion_url + '">motion .pt</a> · ' +
+      '<a href="' + meta.video_url + '">video (server)</a>';
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('audio', file);
+  fd.append('shape_id', document.getElementById('shape_id').value.trim());
+  fd.append('style_id', document.getElementById('style_id').value.trim());
+  const clOn = document.getElementById('clip_length').value.trim();
+  if (clOn) fd.append('clip_length', clOn);
+  const rs = await fetch('/api/session', { method: 'POST', body: fd });
+  const js = await rs.json();
+  if (!js.ok) {
+    document.getElementById('log').innerHTML = '<span class="err">session: ' + (js.error || rs.status) + '</span>';
+    return;
+  }
+  const token = js.token;
+  document.getElementById('log').textContent = 'Draining online MP4 stream…';
+
+  const tStream0 = performance.now();
+  const streamResp = await fetch('/api/online_mjpeg/' + token + '?t=' + Date.now());
+  if (!streamResp.ok) {
+    document.getElementById('log').innerHTML = '<span class="err">stream HTTP ' + streamResp.status + '</span>';
+    return;
+  }
+  await streamResp.arrayBuffer();
+  const streamWallS = (performance.now() - tStream0) / 1000;
+
+  const st = await fetch('/api/session/' + token + '/status');
+  const sj = await st.json();
+  if (!sj.ok) {
+    document.getElementById('log').innerHTML = '<span class="err">status ' + st.status + '</span>';
+    return;
+  }
+  if (sj.status === 'error') {
+    document.getElementById('log').innerHTML = '<span class="err">' + (sj.error || '?') + '</span>';
+    return;
+  }
+  if (sj.status !== 'done') {
+    document.getElementById('log').innerHTML = '<span class="err">unexpected status: ' + sj.status + '</span>';
+    return;
+  }
+
+  document.getElementById('log').textContent = 'Done (online).';
+  document.getElementById('timing').textContent = JSON.stringify({
+    server: { timing: sj.timing, video_url: sj.video_url, motion_url: sj.motion_url },
+    client_seconds: { online_mp4_stream_wall_s: Number(streamWallS.toFixed(4)) },
+  }, null, 2);
+  document.getElementById('links').innerHTML =
+    '<a href="' + sj.video_url + '">video</a> · <a href="' + sj.motion_url + '">motion .pt</a>';
+};
+</script>
+</body>
+</html>

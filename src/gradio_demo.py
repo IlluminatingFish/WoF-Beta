@@ -23,7 +23,7 @@ from app.utils_videos import write_video
 
 
 class ARTAvatarInferEngine:
-    def __init__(self, load_gaga=False, fix_pose=False, clip_length=750, device='cuda'):
+    def __init__(self, load_gaga=False, fix_pose=False, clip_length=None, device='cuda'):
         self.device = device
         self.fix_pose = fix_pose
         self.clip_length = clip_length
@@ -70,8 +70,13 @@ class ARTAvatarInferEngine:
         pred_motions = self.generator.inference(audio_batch, with_gtmotion=False)[0]
         torch.cuda.synchronize()
         t1 = time.perf_counter()
+        pred_motions = self.smooth_motion_savgol(pred_motions)
         clip_length = clip_length if clip_length is not None else self.clip_length
-        pred_motions = self.smooth_motion_savgol(pred_motions)[:clip_length]
+        if clip_length is not None:
+            pred_motions = pred_motions[:clip_length]
+        else:
+            n_audio_frames = max(1, int(audio.shape[0] * 25 // 16000))
+            pred_motions = pred_motions[: min(int(pred_motions.shape[0]), n_audio_frames)]
         if self.fix_pose:
             pred_motions[..., 100:103] *= 0.0
         pred_motions[..., 104:] *= 0.0
@@ -81,7 +86,7 @@ class ARTAvatarInferEngine:
         print(f'Motion inference: {n_frames} frames in {motion_time:.2f}s ({motion_fps:.1f} FPS)')
         return pred_motions, {'motion_frames': n_frames, 'motion_time': motion_time, 'motion_fps': motion_fps}
 
-    def rendering(self, audio, pred_motions, shape_id="mesh", shape_code=None, save_name='ARTAvatar.mp4'):
+    def rendering(self, audio, pred_motions, shape_id="mesh", shape_code=None, save_name='ARTAvatar'):
         print(f'Rendering ({shape_id})...')
         pred_images = []
         torch.cuda.synchronize()
@@ -114,7 +119,7 @@ class ARTAvatarInferEngine:
         dump_path = os.path.join(self.output_dir, '{}.mp4'.format(save_name))
         t2 = time.perf_counter()
         audio = audio[:int(pred_images.shape[0]/25.0*16000)]
-        write_video(pred_images*255.0, dump_path, 25.0, audio, 16000, "aac")
+        write_video(pred_images * 255.0, dump_path, 25.0, audio, 16000, "aac")
         t3 = time.perf_counter()
         encode_time = t3 - t2
         print(f'Video encoding: {encode_time:.2f}s')
@@ -195,7 +200,14 @@ def run_gradio_app(engine):
             gr.Warning("Please select or upload an avatar")
             return None, None, ""
         if input_type == "Text":
-            gtts_lang = {"English": "en", "中文": "zh", "日本語": "ja", "Deutsch": "de", "Français": "fr", "Español": "es"}
+            gtts_lang = {
+                "English": "en",
+                "Chinese": "zh",
+                "Japanese": "ja",
+                "German": "de",
+                "French": "fr",
+                "Spanish": "es",
+            }
             tts = gTTS(text=text_input, lang=gtts_lang[text_language])
             tts.save("./render_results/tts_output.wav")
             audio_input = "./render_results/tts_output.wav"
@@ -286,7 +298,7 @@ def run_gradio_app(engine):
                         lines=3
                     )
                     text_language = gr.Dropdown(
-                        choices=["English", "中文", "日本語", "Deutsch", "Français", "Español"],
+                        choices=["English", "Chinese", "Japanese", "German", "French", "Spanish"],
                         value="English",
                         label="Language"
                     )
@@ -399,7 +411,7 @@ def run_gradio_app(engine):
             ["Audio", "demo/cn1.wav", None, None, "11.jpg", "natural_1"],
             ["Audio", "demo/cn2.wav", None, None, "12.jpg", "happy_2"],
             ["Text", None, "Hello, this is a demo! Let's create something fun together.", "English", "12.jpg", "happy_0"],
-            ["Text", None, "让我们一起创造一些有趣的东西吧。", "中文", "12.jpg", "natural_0"],
+            ["Text", None, "Bonjour, voici une courte démo.", "French", "12.jpg", "natural_0"],
         ]
         example_inputs = [input_type, audio_input, text_input, text_language, appearance, style]
         gr.Examples(examples=examples, inputs=example_inputs, outputs=[mesh_output, avatar_output, benchmark_output])
@@ -412,7 +424,13 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--audio_path', '-a', default=None, type=str)
-    parser.add_argument('--clip_length', '-l', default=750, type=int)
+    parser.add_argument(
+        '--clip_length',
+        '-l',
+        default=None,
+        type=int,
+        help='Max motion frames; default from audio at 25 fps.',
+    )
     parser.add_argument("--shape_id", '-i', default='mesh', type=str)
     parser.add_argument("--style_id", '-s', default='default', type=str)
     parser.add_argument("--run_app", action='store_true')

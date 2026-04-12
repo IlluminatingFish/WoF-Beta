@@ -140,6 +140,7 @@ dependencies:
       - einops==0.8.1
       - executing==2.1.0
       - face-alignment==1.4.1
+      - flask==3.0.3
       - fastapi==0.115.11
       - ffmpy==0.5.0
       - fonttools==4.54.1
