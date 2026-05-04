@@ -1,0 +1,1 @@
+python inference.py --audio_path ./demo/eng1.wav --shape_id src/assets/GAGAvatar/examples/2.jpg --style_id default --clip_length 750
